@@ -933,7 +933,7 @@ class DLTClient(cDltClient):
                 # - create a python socket object so that we can detect
                 # connection loss in the main_loop below as described at
                 # http://stefan.buettcher.org/cs/conn_closed.html
-                self._connected_socket = socket.fromfd(self.sock, socket.AF_INET6, socket.SOCK_STREAM)
+                self._connected_socket = socket.fromfd(socket.AF_INET, socket.SOCK_STREAM)
             if error_count > MAX_LOG_IN_ROW:
                 logger.debug("Surpressed %d messages for failed connection attempts", error_count - MAX_LOG_IN_ROW)
 
