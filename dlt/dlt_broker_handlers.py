@@ -3,108 +3,19 @@
 filtering DLT messages
 """
 from __future__ import absolute_import
-from collections import defaultdict
-import ctypes
 import logging
-from multiprocessing import Lock, Process, Value
-from multiprocessing.queues import Empty
 import socket
 import time
-from threading import Thread, Event
+
+from collections import defaultdict
+from threading import Thread, Event, Lock
+from multiprocessing import Process
+from multiprocessing.queues import Empty
 
 from dlt.dlt import DLTClient, DLT_DAEMON_TCP_PORT, py_dlt_client_main_loop
 
 DLT_CLIENT_TIMEOUT = 5
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
-
-
-class DLTTimeValue(object):
-    """Create a share memory to pass the timestamp between processes
-
-    The type of dlt time is float (4 bytes). There are several ways to send
-    the value between DLTMessageHandler (it's a process) and DLTBroker. Since
-    DLTMessageHandler has to send the value many times every second, choosing a
-    lightweight solution is must.
-
-    khiz678 studied and evaluated the following solutions for the problem.
-      - multiprocessing.Queue (Queue in the following discussion)
-      - multiprocessing.Pipe (Pipe in the following discussion)
-      - multiprocessing.Value (Value in the following discussion)
-
-    Value is our final solution. Queue's implementation is based on Pipe (in
-    cpython). If the solution is based on Queue or Pipe, it needs another
-    thread in DLTBroker process to receive and write the value to a local
-    variable. The solution based on Value does not have such problem, only
-    assigns the value to the shared memory directly.
-
-    khiz678 also did a simple benchmark for the Value solution. It could
-    receive more than 100000 timestamps per second.  It's twice faster than
-    Pipe's implementation.
-    """
-
-    def __init__(self, default_value=0.0):
-        self._timestamp_mem = Value(ctypes.c_double, default_value)
-
-    @property
-    def timestamp(self):
-        """Get the seconds from 1970/1/1 0:00:00
-
-        :rtype: float
-        """
-        with self._timestamp_mem.get_lock():
-            return self._timestamp_mem.value
-
-    @timestamp.setter
-    def timestamp(self, new_timestamp):
-        with self._timestamp_mem.get_lock():
-            self._timestamp_mem.value = new_timestamp
-
-
-class DLTFilterAckMessageHandler(Thread):
-    """Receive filter-set ack message and pass it to the corresponding ack queue"""
-    def __init__(self, filter_ack_queue):  # (multiprocessing.Queue[Tuple[ContextQueueID, bool]]) -> None
-        super(DLTFilterAckMessageHandler, self).__init__()
-
-        self.filter_ack_queue = filter_ack_queue
-
-        self.stop_flag = Event()
-
-        self.context_map_lock = Lock()
-        self.context_map = {}  # Dict[ContextQueueID, Queue.Queue[bool]]
-
-    def stop(self):
-        """Stops thread execution"""
-        self.stop_flag.set()
-        self.filter_ack_queue.put((None, None))
-        if self.is_alive():
-            self.join()
-
-    def register(self, filter_ack_queue):  # (Queue.Queue[bool]) -> None
-        """Register an ack queue"""
-        with self.context_map_lock:
-            self.context_map[id(filter_ack_queue)] = filter_ack_queue
-
-    def unregister(self, filter_ack_queue):  # (Queue.Queue[bool]) -> None
-        """Unregister an ack queue"""
-        with self.context_map_lock:
-            key = id(filter_ack_queue)
-
-            if key in self.context_map:
-                del self.context_map[key]
-
-    def run(self):
-        """Run the thread to recieve the message and dispatch it"""
-        while not self.stop_flag.is_set():
-            queue_ack_id, enable = self.filter_ack_queue.get()
-
-            if not queue_ack_id:
-                continue
-
-            with self.context_map_lock:
-                if queue_ack_id in self.context_map:
-                    self.context_map[queue_ack_id].put(enable)
-                else:
-                    logger.warning("Could not send an ack to the queue: %s", queue_ack_id)
 
 
 class DLTContextHandler(Thread):
@@ -123,16 +34,7 @@ class DLTContextHandler(Thread):
         self.filter_queue = filter_queue
         self.message_queue = message_queue
 
-    def _make_send_filter_msg(self, queue, filters, is_register, context_filter_ack_queue=None):
-        """Send a filter message to the filter message queue"""
-        queue_id = id(queue)
-
-        if context_filter_ack_queue:
-            return queue_id, id(context_filter_ack_queue), filters, is_register
-
-        return queue_id, filters, is_register
-
-    def register(self, queue, filters=None, context_filter_ack_queue=None):
+    def register(self, queue, filters=None):
         """Register a queue to collect messages matching specific filters
 
         :param Queue queue: The new queue to add
@@ -148,11 +50,9 @@ class DLTContextHandler(Thread):
 
         # - inform the DLTMessageHandler process about this new
         # (queue, filter) pair
-        self.filter_queue.put(
-            self._make_send_filter_msg(queue, filters, True, context_filter_ack_queue=context_filter_ack_queue)
-        )
+        self.filter_queue.put((queue_id, filters, True))
 
-    def unregister(self, queue, context_filter_ack_queue=None):
+    def unregister(self, queue):
         """Remove a queue from set of queues being handled
 
         :param Queue queue: The queue to remove
@@ -168,9 +68,7 @@ class DLTContextHandler(Thread):
 
             # - inform the DLTMessageHandler process about removal of this
             # (queue, filter) pair
-            self.filter_queue.put(
-                self._make_send_filter_msg(queue, filters, False, context_filter_ack_queue=context_filter_ack_queue)
-            )
+            self.filter_queue.put((queue_id, filters, False))
 
     def run(self):
         """The thread's main loop
@@ -207,10 +105,8 @@ class DLTMessageHandler(Process):
     them on the messages queue.
     """
 
-    def __init__(self, filter_queue, message_queue, mp_stop_event, client_cfg,
-                 dlt_time_value=None, filter_ack_queue=None):
+    def __init__(self, filter_queue, message_queue, mp_stop_event, client_cfg):
         self.filter_queue = filter_queue
-        self.filter_ack_queue = filter_ack_queue
         self.message_queue = message_queue
         self.mp_stop_flag = mp_stop_event
         super(DLTMessageHandler, self).__init__()
@@ -225,8 +121,6 @@ class DLTMessageHandler(Process):
         self.timeout = client_cfg.get("timeout", DLT_CLIENT_TIMEOUT)
         self._client = None
         self.tracefile = None
-
-        self._dlt_time_value = dlt_time_value
 
     def _client_connect(self):
         """Create a new DLTClient
@@ -246,15 +140,7 @@ class DLTMessageHandler(Process):
     def _process_filter_queue(self):
         """Check if filters have been added or need to be removed"""
         while not self.filter_queue.empty():
-            queue_ack_id = None
-
-            msg = self.filter_queue.get_nowait()
-            logger.debug("Process filter queue message: %s", msg)
-            if isinstance(msg, tuple) and len(msg) == 4:
-                queue_id, queue_ack_id, filters, add = msg
-            else:
-                queue_id, filters, add = msg
-
+            queue_id, filters, add = self.filter_queue.get_nowait()
             if add:
                 for apid_ctid in filters:
                     self.context_map[apid_ctid].append(queue_id)
@@ -263,14 +149,10 @@ class DLTMessageHandler(Process):
                     for apid_ctid in filters:
                         self.context_map[apid_ctid].remove(queue_id)
                         if not self.context_map[apid_ctid]:
-                            del self.context_map[apid_ctid]
+                            del(self.context_map[apid_ctid])
                 except (KeyError, ValueError):
                     # - queue_id already removed or not inserted
                     pass
-
-            if self.filter_ack_queue and queue_ack_id:
-                logger.debug("Send filter ack message: queue_ack_id: %s, add: %s", queue_ack_id, add)
-                self.filter_ack_queue.put((queue_ack_id, add))
 
     def handle(self, message):
         """Function to be called for every message received
@@ -281,24 +163,13 @@ class DLTMessageHandler(Process):
         """
         self._process_filter_queue()
 
-        if message and (message.apid != "" or message.ctid != ""):
-            # Dispatch the message
-            msg_ctx = ((message.apid, message.ctid), (None, None), (message.apid, None), (None, message.ctid))
-            qids = (
-                queue_id
-                for filters, queue_ids in self.context_map.items()
-                for queue_id in queue_ids
-                if filters in msg_ctx
-            )
-            for queue_id in qids:
-                if self.message_queue.full():
-                    logger.error("message_queue is full ! put() on this queue will block")
-                self.message_queue.put((queue_id, message))
-
-            # Send the message's timestamp
-            if self._dlt_time_value:
-                self._dlt_time_value.timestamp = message.storage_timestamp
-
+        if message is not None and not (message.apid == "" and message.ctid == ""):
+            for filters, queue_ids in self.context_map.items():
+                if filters in [(message.apid, message.ctid), (None, None), (message.apid, None), (None, message.ctid)]:
+                    for queue_id in queue_ids:
+                        if self.message_queue.full():
+                            logger.error("message_queue is full ! put() on this queue will block")
+                        self.message_queue.put((queue_id, message))
         return not self.mp_stop_flag.is_set()
 
     def run(self):
@@ -336,5 +207,4 @@ class DLTMessageHandler(Process):
                     self._client.disconnect()
 
         self.message_queue.close()
-        self._client.disconnect()
         logger.info("DLTMessageHandler worker execution complete")

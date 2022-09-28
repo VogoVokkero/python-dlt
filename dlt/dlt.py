@@ -4,7 +4,6 @@
 from __future__ import absolute_import
 
 import ctypes
-import ipaddress as ip
 import logging
 import os
 import re
@@ -16,9 +15,9 @@ import threading
 import six
 
 from dlt.core import (
-    cDLTFilter, dltlib, DLT_CLIENT_MODE_UDP_MULTICAST, DLT_ID_SIZE, DLT_HTYP_WEID, DLT_HTYP_WSID, DLT_HTYP_WTMS,
-    DLT_HTYP_UEH, DLT_RETURN_OK, DLT_RETURN_ERROR, DLT_RETURN_TRUE, DLT_MESSAGE_ERROR_OK,
-    cDltExtendedHeader, cDltClient, MessageMode, cDLTMessage, cDltStorageHeader, cDltStandardHeader,
+    dltlib, DLT_ID_SIZE, DLT_HTYP_WEID, DLT_HTYP_WSID, DLT_HTYP_WTMS, DLT_HTYP_UEH, DLT_RETURN_OK,
+    DLT_RETURN_ERROR, DLT_RETURN_TRUE, DLT_FILTER_MAX, DLT_MESSAGE_ERROR_OK, cDltExtendedHeader,
+    cDltClient, MessageMode, cDLTMessage, cDltStorageHeader, cDltStandardHeader,
     DLT_TYPE_INFO_UINT, DLT_TYPE_INFO_SINT, DLT_TYPE_INFO_STRG, DLT_TYPE_INFO_SCOD,
     DLT_TYPE_INFO_TYLE, DLT_TYPE_INFO_VARI, DLT_TYPE_INFO_RAWD,
     DLT_SCOD_ASCII, DLT_SCOD_UTF8, DLT_TYLE_8BIT, DLT_TYLE_16BIT, DLT_TYLE_32BIT, DLT_TYLE_64BIT,
@@ -34,7 +33,12 @@ except Exception:  # pylint: disable=broad-except
     pass
 
 MAX_LOG_IN_ROW = 3
+# Return value for DLTFilter.add() - exceeded maximum number of filters
+MAX_FILTER_REACHED = 1
+# Return value for DLTFilter.add() - specified filter already exists
+REPEATED_FILTER = 2
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+
 
 DLT_EMPTY_FILE_ERROR = "DLT TRACE FILE IS EMPTY"
 cDLT_FILE_NOT_OPEN_ERROR = "Could not open DLT Trace file (libdlt)"  # pylint: disable=invalid-name
@@ -60,10 +64,21 @@ class cached_property(object):  # pylint: disable=invalid-name
         return value
 
 
-class DLTFilter(cDLTFilter):
+class DLTFilter(ctypes.Structure):
     """Structure to store filter parameters. ID are maximal four characters. Unused values are filled with zeros.
     If every value as filter is valid, the id should be empty by having only zero values.
+
+    typedef struct
+    {
+        char apid[DLT_FILTER_MAX][DLT_ID_SIZE]; /**< application id */
+        char ctid[DLT_FILTER_MAX][DLT_ID_SIZE]; /**< context id */
+        int  counter;                           /**< number of filters */
+    } DltFilter;
     """
+
+    _fields_ = [("apid", (ctypes.c_char * DLT_ID_SIZE) * DLT_FILTER_MAX),
+                ("ctid", (ctypes.c_char * DLT_ID_SIZE) * DLT_FILTER_MAX),
+                ("counter", ctypes.c_int)]
 
     verbose = 0
 
@@ -76,6 +91,21 @@ class DLTFilter(cDLTFilter):
     def __del__(self):
         if dltlib.dlt_filter_free(ctypes.byref(self), self.verbose) == DLT_RETURN_ERROR:
             raise RuntimeError("Could not cleanup DLTFilter")
+
+    def add(self, apid, ctid):
+        """Add new filter pair"""
+        if six.PY3:
+            if isinstance(apid, str):
+                apid = bytes(apid, "ascii")
+            if isinstance(ctid, str):
+                ctid = bytes(ctid, "ascii")
+        if dltlib.dlt_filter_add(ctypes.byref(self), apid or b"", ctid or b"", self.verbose) == DLT_RETURN_ERROR:
+            if self.counter >= DLT_FILTER_MAX:
+                logger.error("Maximum number (%d) of allowed filters reached, ignoring filter!\n", DLT_FILTER_MAX)
+                return MAX_FILTER_REACHED
+            logger.debug("Filter ('%s', '%s') already exists", apid, ctid)
+            return REPEATED_FILTER
+        return 0
 
     def __repr__(self):
         """return the 'official' string representation of an object"""
@@ -128,6 +158,7 @@ class Payload(object):
             value = None
             if type_info & DLT_TYPE_INFO_STRG:
                 if (get_scod(type_info) == DLT_SCOD_ASCII) or (get_scod(type_info) == DLT_SCOD_UTF8):
+
                     length = struct.unpack_from("H", self._buf, offset)[0]
                     offset += struct.calcsize("H")
                     value = self._buf[offset:offset + length - 1]  # strip the string terminating char \x00
@@ -206,8 +237,6 @@ class DLTMessage(cDLTMessage, MessageMode):
 
     # object is not initialized if the message is loaded from a file
     initialized_as_object = False
-
-    re_pattern_type = type(re.compile(r"type"))
 
     def __init__(self, *args, **kwords):
         self.initialized_as_object = True
@@ -312,7 +341,7 @@ class DLTMessage(cDLTMessage, MessageMode):
         ctid = b""
         tmsp_value = 0.0
 
-        bytes_offset = 0  # We know where data will be in the message, but ...
+        bytes_offset = 0    # We know where data will be in the message, but ...
         if not htyp_data & DLT_HTYP_WEID:  # if there is no ECU ID and/or Session ID, then it will be earlier
             bytes_offset -= 4
         if not htyp_data & DLT_HTYP_WSID:
@@ -391,30 +420,23 @@ class DLTMessage(cDLTMessage, MessageMode):
             return self.apid == other.apid and self.ctid == other.ctid and self.__eq__(other)
 
         # pylint: disable=protected-access
-        if hasattr(other, "_fields_") and [x[0] for x in other._fields_] == [
-                "apid",
-                "ctid",
-                "log_level",
-                "payload_max",
-                "payload_min",
-                "counter",
-        ]:
+        if hasattr(other, "_fields_") and [x[0] for x in other._fields_] == ["apid", "ctid", "counter"]:
             # other id DLTFilter
             return dltlib.dlt_message_filter_check(ctypes.byref(self), ctypes.byref(other), 0)
 
         if not isinstance(other, dict):
-            raise TypeError(
-                "other must be instance of dlt.dlt.DLTMessage, dlt.dlt.DLTFilter or a dictionary"
-                " found: {}".format(type(other))
-            )
+            raise TypeError("other must be instance of mgu_dlt.dlt.DLTMessage, mgu_dlt.dlt.DLTFilter or a dictionary"
+                            " found: {}".format(type(other)))
+
+        re_pattern_type = type(re.compile(r"type"))
 
         other = other.copy()
         apid = other.get("apid", None)
-        if apid and not isinstance(apid, self.re_pattern_type) and self.apid != apid:
+        if apid and not isinstance(apid, re_pattern_type) and self.apid != apid:
             return False
 
         ctid = other.get("ctid", None)
-        if ctid and not isinstance(ctid, self.re_pattern_type) and self.ctid != ctid:
+        if ctid and not isinstance(ctid, re_pattern_type) and self.ctid != ctid:
             return False
 
         for key, val in other.items():
@@ -424,7 +446,7 @@ class DLTMessage(cDLTMessage, MessageMode):
             msg_val = getattr(self, key, b"")
             if not msg_val:
                 return False
-            if isinstance(val, self.re_pattern_type):
+            if isinstance(val, re_pattern_type):
                 if not val.search(msg_val):
                     return False
             elif msg_val != val:
@@ -447,7 +469,7 @@ class DLTMessage(cDLTMessage, MessageMode):
     # convenient access to import DLT message attributes
     # no need to remember in which header are those attrs defined
     @cached_property
-    def ecuid(self):  # pylint: disable=invalid-overridden-method
+    def ecuid(self):   # pylint: disable=invalid-overridden-method
         """Get the ECU ID
 
         :returns: ECU ID
@@ -536,7 +558,7 @@ class DLTMessage(cDLTMessage, MessageMode):
         :returns: storage header timestamp
         :rtype: float
         """
-        return self.storageheader.seconds + self.storageheader.microseconds * 0.000001
+        return float("{}.{}".format(self.storageheader.seconds, self.storageheader.microseconds))
 
 
 class cDLTFile(ctypes.Structure):  # pylint: disable=invalid-name
@@ -552,8 +574,8 @@ class cDLTFile(ctypes.Structure):  # pylint: disable=invalid-name
         int32_t counter;       /**< number of messages in DLT file with filter */
         int32_t counter_total; /**< number of messages in DLT file without filter */
         int32_t position;      /**< current index to message parsed in DLT file starting at 0 */
-        uint64_t file_length;  /**< length of the file */
-        uint64_t file_position; /**< current position in the file */
+        long file_length;  /**< length of the file */
+        long file_position; /**< current position in the file */
 
         /* error counters */
         int32_t error_messages; /**< number of incomplete DLT messages found during file parsing */
@@ -573,8 +595,8 @@ class cDLTFile(ctypes.Structure):  # pylint: disable=invalid-name
                 ("counter", ctypes.c_int32),
                 ("counter_total", ctypes.c_int32),
                 ("position", ctypes.c_int32),
-                ("file_length", ctypes.c_uint64),
-                ("file_position", ctypes.c_uint64),
+                ("file_length", ctypes.c_long),
+                ("file_position", ctypes.c_long),
                 ("error_messages", ctypes.c_int32),
                 ("filter", ctypes.POINTER(DLTFilter)),
                 ("filter_counter", ctypes.c_int32),
@@ -614,7 +636,7 @@ class cDLTFile(ctypes.Structure):  # pylint: disable=invalid-name
         :rtype: int
         """
         with open(self.filename, "rb") as fobj:
-            last_position = self.file_position  # pylint: disable=access-member-before-definition
+            last_position = self.file_position   # pylint: disable=access-member-before-definition
             fobj.seek(last_position)
             buf = fobj.read(1024)
             while buf:
@@ -841,7 +863,6 @@ class DLTClient(cDltClient):
     verbose = 0
 
     def __init__(self, **kwords):
-        self.is_udp_multicast = False
         self.verbose = kwords.pop("verbose", 0)
         if dltlib.dlt_client_init(ctypes.byref(self), self.verbose) == DLT_RETURN_ERROR:
             raise RuntimeError("Could not initialize DLTClient")
@@ -854,25 +875,6 @@ class DLTClient(cDltClient):
             if ip_init_state == DLT_RETURN_ERROR:
                 raise RuntimeError("Could not initialize servIP for DLTClient")
 
-            if ip.ip_address(serv_ip.decode("utf8")).is_multicast:
-                self.is_udp_multicast = True
-                if "hostIP" in kwords:
-                    host_ip = kwords.pop("hostIP")
-                    if isinstance(host_ip, str):
-                        host_ip = host_ip.encode('utf8')
-                    ip_init_state = dltlib.dlt_client_set_host_if_address(
-                        ctypes.byref(self),
-                        ctypes.create_string_buffer(host_ip)
-                    )
-                    if ip_init_state == DLT_RETURN_ERROR:
-                        raise RuntimeError("Could not initialize multicast address for DLTClient")
-
-                set_mode_state = dltlib.dlt_client_set_mode(ctypes.byref(self),
-                                                            DLT_CLIENT_MODE_UDP_MULTICAST)
-
-                if set_mode_state == DLT_RETURN_ERROR:
-                    raise RuntimeError("Could not initialize socket mode for DLTClient")
-
         # attribute to hold a reference to the connected socket in case
         # we created a connection with a timeout (via python, as opposed
         # to dltlib). This avoids the socket object from being garbage
@@ -884,6 +886,11 @@ class DLTClient(cDltClient):
         # (re)set self.port, even for API version <2.16.0 since we use
         # it ourselves elsewhere
         self.port = kwords.get("port", DLT_DAEMON_TCP_PORT)
+
+    def __del__(self):
+        if dltlib.dlt_client_cleanup(ctypes.byref(self), self.verbose) == DLT_RETURN_ERROR:
+            raise RuntimeError("Could not cleanup DLTClient")
+        self.disconnect()
 
     def connect(self, timeout=None):
         """Connect to the server
@@ -898,54 +905,39 @@ class DLTClient(cDltClient):
         """
         connected = None
         error_count = 0
-        if not self.is_udp_multicast:
-            if timeout:
-                end_time = time.time() + timeout
-                while time.time() < end_time:
-                    timeout_remaining = max(end_time - time.time(), 1) if timeout else None
-                    try:
-                        self._connected_socket = socket.create_connection((ctypes.string_at(self.servIP), self.port),
-                                                                          timeout=timeout_remaining)
-                    except IOError as exc:
-                        if error_count < MAX_LOG_IN_ROW:
-                            logger.debug("DLT client connect failed to connect to %s:%s : %s",
-                                         self.servIP, self.port, exc)
-                        error_count += 1
-                        time.sleep(1)
+        if timeout:
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                timeout_remaining = max(end_time - time.time(), 1) if timeout else None
+                try:
+                    self._connected_socket = socket.create_connection((ctypes.string_at(self.servIP), self.port),
+                                                                      timeout=timeout_remaining)
+                except IOError as exc:
+                    if error_count < MAX_LOG_IN_ROW:
+                        logger.debug("DLT client connect failed to connect to %s:%s : %s",
+                                     self.servIP, self.port, exc)
+                    error_count += 1
+                    time.sleep(1)
 
-                    if self._connected_socket:
-                        # pylint: disable=attribute-defined-outside-init
-                        self.sock = ctypes.c_int(self._connected_socket.fileno())
-                        # - also init the receiver to replicate
-                        # dlt_client_connect() behavior
-                        if hasattr(self.receiver, "type"):
-                            connected = dltlib.dlt_receiver_init(ctypes.byref(self.receiver),
-                                                                 self.sock,
-                                                                 DLT_RECEIVE_SOCKET,
-                                                                 DLT_CLIENT_RCVBUFSIZE)
-                        else:
-                            connected = dltlib.dlt_receiver_init(ctypes.byref(self.receiver),
-                                                                 self.sock,
-                                                                 DLT_CLIENT_RCVBUFSIZE)
-                        break
-            else:
-                connected = dltlib.dlt_client_connect(ctypes.byref(self), self.verbose)
-                # - create a python socket object so that we can detect
-                # connection loss in the main_loop below as described at
-                # http://stefan.buettcher.org/cs/conn_closed.html
-                self._connected_socket = socket.fromfd(socket.AF_INET, socket.SOCK_STREAM)
-            if error_count > MAX_LOG_IN_ROW:
-                logger.debug("Surpressed %d messages for failed connection attempts", error_count - MAX_LOG_IN_ROW)
-
+                if self._connected_socket:
+                    # pylint: disable=attribute-defined-outside-init
+                    self.sock = ctypes.c_int(self._connected_socket.fileno())
+                    # - also init the receiver to replicate
+                    # dlt_client_connect() behavior
+                    connected = dltlib.dlt_receiver_init(ctypes.byref(self.receiver), self.sock, DLT_CLIENT_RCVBUFSIZE)
+                    break
         else:
             connected = dltlib.dlt_client_connect(ctypes.byref(self), self.verbose)
-
+            # - create a python socket object so that we can detect
+            # connection loss in the main_loop below as described at
+            # http://stefan.buettcher.org/cs/conn_closed.html
+            self._connected_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if error_count > MAX_LOG_IN_ROW:
+            logger.debug("Surpressed %d messages for failed connection attempts", error_count - MAX_LOG_IN_ROW)
         return connected == DLT_RETURN_OK
 
     def disconnect(self):
         """Close all sockets"""
-        if dltlib.dlt_client_cleanup(ctypes.byref(self), self.verbose) == DLT_RETURN_ERROR:
-            raise RuntimeError("Could not cleanup DLTClient")
         if self._connected_socket:
             try:
                 self._connected_socket.shutdown(socket.SHUT_RDWR)
@@ -993,25 +985,6 @@ class DLTClient(cDltClient):
         """Get the mode"""
         return getattr(self, "mode", getattr(super(DLTClient, self), "serial_mode", 0))
 
-    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(DLTMessage), ctypes.c_void_p)
-    def msg_callback(msg, data):  # pylint: disable=no-self-argument
-        """Implements a simple callback that prints a dlt message received"""
-        if msg is None:
-            print("NULL message in callback")
-            return -1
-        if msg.contents.p_standardheader.contents.htyp & DLT_HTYP_WEID:
-            dltlib.dlt_set_storageheader(msg.contents.p_storageheader, msg.contents.headerextra.ecu)
-        else:
-            dltlib.dlt_set_storageheader(msg.contents.p_storageheader, ctypes.c_char_p(""))
-
-        print(msg.contents)
-        return 0
-
-    def client_loop(self):
-        """Executes native dlt_client_main_loop() after registering msg_callback method as callback"""
-        dltlib.dlt_client_register_message_callback(self.msg_callback)
-        dltlib.dlt_client_main_loop(ctypes.byref(self), None, self.verbose)
-
 
 # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches
 def py_dlt_client_main_loop(client, limit=None, verbose=0, dumpfile=None, callback=None):
@@ -1028,18 +1001,17 @@ def py_dlt_client_main_loop(client, limit=None, verbose=0, dumpfile=None, callba
         # this will raise a socket.timeout exception which the caller is
         # expected to handle (possibly by attempting a reconnect)
         # pylint: disable=protected-access
-        if not client.is_udp_multicast:
-            try:
-                ready_to_read = client._connected_socket.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-            except OSError as os_exc:
-                logger.error("[%s]: DLTLib closed connected socket", os_exc)
-                return False
+        try:
+            ready_to_read = client._connected_socket.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except OSError as os_exc:
+            logger.error("[%s]: DLTLib closed connected socket", os_exc)
+            return False
 
-            if not ready_to_read:
-                # - implies that the other end has called close()/shutdown()
-                # (ie: clean disconnect)
-                logger.debug("connection terminated, returning")
-                return False
+        if not ready_to_read:
+            # - implies that the other end has called close()/shutdown()
+            # (ie: clean disconnect)
+            logger.debug("connection terminated, returning")
+            return False
 
         # - check if stop flag has been set (end of loop)
         if callback and not callback(None):
@@ -1052,10 +1024,7 @@ def py_dlt_client_main_loop(client, limit=None, verbose=0, dumpfile=None, callba
         # the status of the callback (in the case of dlt_broker, this is
         # the stop_flag Event), this loop will only proceed after the
         # function has returned or terminate when an exception is raised
-        if hasattr(client.receiver, "type"):
-            recv_size = dltlib.dlt_receiver_receive(ctypes.byref(client.receiver))
-        else:
-            recv_size = dltlib.dlt_receiver_receive(ctypes.byref(client.receiver), DLT_RECEIVE_SOCKET)
+        recv_size = dltlib.dlt_receiver_receive(ctypes.byref(client.receiver), DLT_RECEIVE_SOCKET)
         if recv_size <= 0:
             logger.error("Error while reading from socket")
             return False
