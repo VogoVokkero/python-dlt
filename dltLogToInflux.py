@@ -154,7 +154,7 @@ def clientLoop(client, limit=None, verbose=0, dumpfile=None, callback=None):
 
 
 # You can generate an API token from the "API Tokens Tab" in the UI
-token = "X8cSLJB-7udBo0AMS8ZIXfacJzbrm6pmqQcpzDoIASMte2zSiOawN8cSiJORXPFQ4fiRA0jYueqUXVvmluuNHQ=="
+token = API_TOKEN_HERE
 org = "VOGO"
 bucket = "Vogo"
 
