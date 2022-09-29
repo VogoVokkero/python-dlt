@@ -1,0 +1,50 @@
+version: '3'
+
+
+services:
+  influxdb:
+    image: influxdb:latest
+    container_name: datalogging_influxdb
+    restart: always
+    ports:
+      - '8086:8086'
+    volumes:
+      - influxdb-storage:/var/lib/influxdb
+    environment:
+      - INFLUXDB_DB= "database"
+      - INFLUXDB_ADMIN_USER= "admin"
+      - INFLUXDB_ADMIN_PASSWORD= "adminpsw"
+      
+  chronograf:
+    image: chronograf:latest
+    container_name: datalogging_chronograf
+    ports:
+      - '8888:8888'
+    volumes:
+      - chronograf-storage:/var/lib/chronograf
+    depends_on:
+      - influxdb
+    restart: always
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_USERNAME= "admin"
+      - INFLUXDB_PASSWORD= "adminpsw"
+      
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: datalogging_grafana
+    ports:
+      - '3000:3000'
+    restart: always
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      - influxdb
+
+
+volumes:
+  grafana-storage:
+  influxdb-storage:
+  chronograf-storage:
+
+ 
