@@ -8,6 +8,11 @@ the intended use.
 
 The version is different form the master branch on the repository this has been forked from as we used the version in the ubuntu repository for Ubuntu 20.04. But even like that due to some compatibility problem we had to rewrite the socket connection part of dlt.py to remove the use of Ipv6 and replace the fromfd by a normal socket connection.
 
+Note: Due to how python work when looking for a module to import it:
+- Look in /usr/lib/python3/dist-packages/ for the package name and files
+if the package doesn't exist in this folder, it will look in the folder where the python script has been called.
+Which mean that it will find our dlt/ folder with the module inside and use it, which mean we don't have to actually install the library in the system as long as we accept that it will stay in the code folder (and that it will not be accessible by other python scripts outside).
+
 
 dltLogToInflux.py
 =================
