@@ -19,3 +19,17 @@ Require one argument to launch which is the IP of the dlt-daemon of the target.
 It also require to possibly modify the Org, Bucket and TokenAPI fields for the influxdb database.
 
 It will connect to a dlt-daemon, find the trace we need, split them into an array and compare some values to be sure we got the right trace, if it is the case we will get the value we need, calculate a cpu-load and RSS and send them both to the influxDB.
+
+
+Docker-compose.yaml
+===================
+
+Once the python file is correct and manage to connect to the socket as wanted we now have to set up the services such as influxdb to store our data and possibly other service like Grafana for live monitoring.
+
+Now, for user convenience and to not bother too much with settings such services and configuring them we have a docker-compose.yml file.
+The goal of such file is to give rules about docker instances and services. This docker file will set every instances and services automatically for our use, with possible configuration (such as ports) that we can modify.
+
+By using a command "sudo docker-compose up" we are able to start them all at once, with their configurations as declared in the yml file.
+
+we can now access the influxdb CI with localhost:8086 or the grafana via localhost:3000
+Once the CI access to Influxdb is possible we can also get the API token needed to connect it to our python script.
